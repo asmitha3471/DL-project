@@ -1,135 +1,94 @@
+import os
+import streamlit as st
 import pandas as pd
 import numpy as np
+import joblib
+import librosa
+import soundfile as sf
 import matplotlib.pyplot as plt
-from IPython.display import display
-
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import KFold, cross_val_score
-
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
 
-# Read in track metadata with genre labels
-tracks = pd.read_csv('datasets/fma-rock-vs-hiphop.csv')
+# 📌 Step 1: Load Models (REMOVED PCA)
+model_files = ["models/logistic_regression_model.pkl", "models/scaler.pkl"]
 
-# Read in track metrics with the features
-echonest_metrics = pd.read_json('datasets/echonest-metrics.json', precise_float=True)
+# Ensure models exist before loading
+for model in model_files:
+    if not os.path.exists(model):
+        st.error(f"❌ Model file missing: {model}. Please train the models first.")
+        st.stop()
 
-# Merge the relevant columns of tracks and echonest_metrics
-echo_tracks = pd.merge(echonest_metrics, tracks[['track_id' , 'genre_top']], how='inner', on='track_id')
+# Load trained models (REMOVED PCA)
+logreg_model = joblib.load("models/logistic_regression_model.pkl")
+scaler = joblib.load("models/scaler.pkl")
 
-# Inspect the resultant dataframe
-echo_tracks.info()
+# 📌 Step 2: Extract Features from Audio
+def extract_audio_features(file_path):
+    try:
+        y, sr = librosa.load(file_path, sr=None)
+        if y is None or len(y) == 0:
+            return None  # Skip empty/corrupt files
 
-# Create a correlation matrix
-corr_metrics = echo_tracks.corr()
-corr_metrics.style.background_gradient()
+        # Extract **only the 8 selected features**
+        features = {
+            "spectral_centroid_mean": np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)),  
+            "rms_mean": np.mean(librosa.feature.rms(y=y)),  
+            "mfcc1_mean": np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=1)),  # ✅ Corrected
+            "spectral_bandwidth_mean": np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr)),  
+            "rolloff_mean": np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr)),  
+            "zero_crossing_rate_mean": np.mean(librosa.feature.zero_crossing_rate(y)),  
+            "tempo": librosa.beat.tempo(y=y, sr=sr)[0] if len(y) > 0 else 0,  
+            "chroma_stft_mean": np.mean(librosa.feature.chroma_stft(y=y, sr=sr))  # ✅ Corrected
+        }
 
-# Define our features 
-features = echo_tracks.drop(['track_id', 'genre_top'], axis=1)
+        return np.array(list(features.values())), list(features.keys())  # Return feature values and names
+    
+    except Exception as e:
+        print(f"❌ Error extracting features: {e}")
+        return None, None
 
-# Define our labels
-labels = echo_tracks.genre_top
+# 📌 Step 3: Predict Genre from Audio File (REMOVED PCA)
+def predict_genre_from_audio(file_path):
+    features, feature_names = extract_audio_features(file_path)
 
-# Scale the features and set the values to a new variable
-scaler = StandardScaler()
-scaled_train_features = scaler.fit_transform(features)
+    if features is not None:
+        print(f"Extracted Features: {feature_names}")  # ✅ Debugging Step
+        try:
+            features_df = pd.DataFrame([features], columns=feature_names)
 
-# Get our explained variance ratios from PCA using all features
-pca = PCA()
-pca.fit(scaled_train_features)
-exp_variance = pca.explained_variance_ratio_
+            # Scale features
+            scaled_features = scaler.transform(features_df)
 
-# plot the explained variance using a barplot
-fig, ax = plt.subplots()
-ax.bar(range(pca.n_components_), exp_variance)
-ax.set_xlabel('Principal Component #')
+            # Predict genre
+            predicted_genre = logreg_model.predict(scaled_features)[0]
+            return predicted_genre
+        except ValueError as e:
+            st.error(f"🚨 Feature mismatch error: {e}")
+            return None
+    return None
 
-# Calculate the cumulative explained variance
-cum_exp_variance = np.cumsum(exp_variance)
+# 📌 Step 4: Streamlit Web App (with Audio file upload only)
+def run_streamlit_app():
+    st.title("🎵 Music Genre Prediction App")
+    st.write("Upload a music file to predict the genre.")
 
-# Plot the cumulative explained variance and draw a dashed line at 0.85.
-fig, ax = plt.subplots()
-ax.plot(cum_exp_variance)
-ax.axhline(y=0.85, linestyle='--')
+    uploaded_file = st.file_uploader("Upload an audio file (.mp3, .wav)", type=["mp3", "wav"])
+    if uploaded_file is not None:
+        st.audio(uploaded_file, format="audio/wav")
 
-# choose the n_components where about 85% of our variance can be explained
-n_components = 6
+        # Save file temporarily
+        file_path = f"temp_audio.{uploaded_file.name.split('.')[-1]}"
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-# Perform PCA with the chosen number of components and project data onto components
-pca = PCA(n_components, random_state=10)
-pca.fit(scaled_train_features)
-pca_projection = pca.transform(scaled_train_features)
+        if st.button("Predict Genre from Audio 🎧"):
+            genre = predict_genre_from_audio(file_path)
+            if genre:
+                st.success(f"🎶 Predicted Genre: **{genre}**")
+            else:
+                st.error("Could not extract features from the audio.")
 
-# Split our data
-train_features, test_features, train_labels, test_labels = train_test_split(
-    pca_projection, labels, random_state=10)
-
-# Train our decision tree
-tree = DecisionTreeClassifier(random_state=10)
-tree.fit(train_features, train_labels)
-
-# Predict the labels for the test data
-pred_labels_tree = tree.predict(test_features)
-
-# Train our logistic regression and predict labels for the test set
-logreg = LogisticRegression(random_state=10)
-logreg.fit(train_features, train_labels)
-pred_labels_logit = logreg.predict(test_features)
-
-# Create the classification report for both models
-from sklearn.metrics import classification_report
-class_rep_tree = classification_report(test_labels, pred_labels_tree)
-class_rep_log = classification_report(test_labels, pred_labels_logit)
-
-print("Decision Tree: \n", class_rep_tree)
-print("Logistic Regression: \n", class_rep_log)
-
-# Subset a balanced proportion of data points
-hop_only = echo_tracks.loc[echo_tracks['genre_top'] == 'Hip-Hop']
-rock_only = echo_tracks.loc[echo_tracks['genre_top'] == 'Rock']
-
-# subset only the rock songs, and take a sample the same size as there are hip-hop songs
-rock_only = rock_only.sample(hop_only.shape[0], random_state=10)
-
-# concatenate the dataframes hop_only and rock_only
-rock_hop_bal = pd.concat([rock_only, hop_only])
-
-# The features, labels, and pca projection are created for the balanced dataframe
-features = rock_hop_bal.drop(['genre_top', 'track_id'], axis=1) 
-labels = rock_hop_bal['genre_top']
-pca_projection = pca.fit_transform(scaler.fit_transform(features))
-
-# Redefine the train and test set with the pca_projection from the balanced data
-train_features, test_features, train_labels, test_labels = train_test_split(
-    pca_projection, labels, random_state=10)
-
-# Train our decision tree on the balanced data
-tree = DecisionTreeClassifier()
-tree.fit(train_features, train_labels)
-pred_labels_tree = tree.predict(test_features)
-
-# Train our logistic regression on the balanced data
-logreg = LogisticRegression()
-logreg.fit(train_features, train_labels)
-pred_labels_logit = logreg.predict(test_features)
-
-# Compare the models
-print("Decision Tree: \n", classification_report(test_labels, pred_labels_tree))
-print("Logistic Regression: \n", classification_report(test_labels, pred_labels_tree))
-
-# Set up our K-fold cross-validation
-kf = KFold(n_splits=10)
-
-tree = DecisionTreeClassifier(random_state=10)
-logreg = LogisticRegression(random_state=10)
-
-# Train our models using KFold cv
-tree_score = cross_val_score(tree,pca_projection, labels, cv=kf)
-logit_score = cross_val_score(logreg,pca_projection, labels, cv=kf)
-
-# Print the mean of each array of scores
-print("Decision Tree:", tree_score, "Logistic Regression:", logit_score)
+# 📌 Step 5: Run the App
+if __name__ == "__main__":
+    run_streamlit_app()
